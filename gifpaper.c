@@ -7,6 +7,7 @@
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/Xrandr.h>
+#include <time.h>
 #include <gif_lib.h>
 
 enum {
@@ -18,18 +19,8 @@ enum {
 };
 
 typedef struct {
-    int wait; // Hundredths of a second
-    Pixmap pixmap;
-} Frame;
-
-typedef struct {
     int x, y, w, h;
 } Monitor;
-
-int frame = -1;
-
-int nFrames = 0;
-Frame *frames = NULL;
 
 int nMonitors = 0;
 Monitor *monitors = NULL;
@@ -39,27 +30,37 @@ Screen *screen = NULL;
 Window root = NULL;
 int depth = 0;
 
+GifFileType *gif = NULL;
+
+unsigned char *data = NULL;
+unsigned char *dataScaled = NULL;
+GC gc = NULL;
+
 int antialiasing;
+
+#define PIXMAP_BUFF_SIZE 16
+int iPixbuff = 0;
+Pixmap pixbuff[PIXMAP_BUFF_SIZE] = {(Pixmap)NULL};
 
 void deinit()
 {
-    if (monitors)
-        free(monitors);
-    if (frames) {
-        for (int i = 0; i < nFrames; i++) {
-            // Make sure not to free the current wallpaper
-            if (i != frame && frames[i].pixmap)
-                XFreePixmap(display, frames[i].pixmap);
-        }
-        free(frames);
+    for (int i = 0; i < PIXMAP_BUFF_SIZE; i++) {
+        if (i != iPixbuff && pixbuff[i])
+            XFreePixmap(display, pixbuff[i]);
     }
+    free(data);
+    free(dataScaled);
+    free(monitors);
+    if (gc)
+        XFreeGC(display, gc);
+    if (gif)
+        DGifCloseFile(gif);
     if (display)
         XCloseDisplay(display);
 }
 
 int setWallpaper(Pixmap pixmap)
 {
-    int in, out, w, h;
     Atom prop_root, prop_esetroot, type;
     int format;
     unsigned long length, after;
@@ -68,6 +69,9 @@ int setWallpaper(Pixmap pixmap)
     prop_root = XInternAtom(display, "_XROOTPMAP_ID", True);
     prop_esetroot = XInternAtom(display, "ESETROOT_PMAP_ID", True);
 
+    // The current pixmap being used in the atom; may or may not be spawned from this process
+    Pixmap pixmapCurrent = NULL;
+
     // If someone other than us owns the wallpaper first, we must kill them.
     if (prop_root != None && prop_esetroot != None) {
         XGetWindowProperty(display, root, prop_root, 0L, 1L, False, AnyPropertyType, &type, &format, &length, &after, &data_root);
@@ -75,40 +79,55 @@ int setWallpaper(Pixmap pixmap)
             XGetWindowProperty(display, root, prop_esetroot, 0L, 1L, False, AnyPropertyType, &type, &format, &length, &after, &data_esetroot);
             if (data_root && data_esetroot) {
                 if (type == XA_PIXMAP && *((Pixmap *)data_root) == *((Pixmap *)data_esetroot)) {
-                    // Someone's got XROOTPMAP and ESETROOT_PMAP already. Make sure it isn't us!
-                    Pixmap data_pixmap = *((Pixmap *)data_root);
-
-                    int kill = 1;
-                    for (int i = 0; i < nFrames; i++) {
-                        if (data_pixmap == frames[i].pixmap) {
-                            kill = 0;
-                            break;
-                        }
-                    }
-
-                    // If it isn't us, kill it.
-                    if (kill)
-                        XKillClient(display, data_pixmap);
+                    // Record it
+                    pixmapCurrent = *((Pixmap *)data_root);
                 }
             }
+            XFree(data_esetroot);
         }
+        XFree(data_root);
     }
 
-    /* This will locate the property, creating it if it doesn't exist */
+    // Let's overwrite the properties with our pixmap now
     prop_root = XInternAtom(display, "_XROOTPMAP_ID", False);
     prop_esetroot = XInternAtom(display, "ESETROOT_PMAP_ID", False);
 
     if (prop_root == None || prop_esetroot == None) {
-        fprintf(stderr, "error: creation of pixmap property failed.");
+        fprintf(stderr, "error: creation of wallpaper property failed.");
         return 1;
     }
 
+    // Change the properties for the compositor
     XChangeProperty(display, root, prop_root, XA_PIXMAP, 32, PropModeReplace, (unsigned char *)&pixmap, 1);
     XChangeProperty(display, root, prop_esetroot, XA_PIXMAP, 32, PropModeReplace, (unsigned char *)&pixmap, 1);
 
+    // Change the root window
     XSetWindowBackgroundPixmap(display, root, pixmap);
     XClearWindow(display, root);
     XFlush(display);
+
+    // If this pixmap is ours, free it. Otherwise, kill the client.
+    int kill = 0;
+    if (pixmapCurrent) {
+        kill = 1;
+        for (int i = 0; i < PIXMAP_BUFF_SIZE; i++) {
+            if (pixmapCurrent == pixbuff[i]) {
+                kill = 0;
+                break;
+            }
+        }
+    }
+
+    if (kill)
+        XKillClient(display, pixmapCurrent);
+
+    // Store the pixmap so we can free it later
+    if (++iPixbuff >= PIXMAP_BUFF_SIZE)
+        iPixbuff = 0;
+    if (pixbuff[iPixbuff])
+        XFreePixmap(display, pixbuff[iPixbuff]);
+    pixbuff[iPixbuff] = pixmap;
+
     return 0;
 }
 
@@ -130,15 +149,8 @@ void scale(unsigned char *dst, int dstWidth, int dstX, int dstY, int dstW, int d
                 int index3 = ((y2 + 1) * srcWidth + x2) * 4;
                 int index4 = ((y2 + 1) * srcWidth + (x2 + 1)) * 4;
 
-                for (int i = 0; i < 3; i++) {
-                    int dstTest = (int)((float)src[index1 + i] * (1.0f - dx) * (1.0f - dy) + (float)src[index2 + i] * (dx) * (1.0f - dy) + (float)src[index3 + i] * (1.0f - dx) * (dy) + (float)src[index4 + i] * (dx) * (dy));
-                    if (dstTest > 255)
-                        dst[indexDst + i] = 255;
-                    else if (dstTest < 0)
-                        dst[indexDst + i] = 0;
-                    else
-                        dst[indexDst + i] = dstTest;
-                }
+                for (int i = 0; i < 3; i++)
+                    dst[indexDst + i] = (int)((float)src[index1 + i] * (1.0f - dx) * (1.0f - dy) + (float)src[index2 + i] * (dx) * (1.0f - dy) + (float)src[index3 + i] * (1.0f - dx) * (dy) + (float)src[index4 + i] * (dx) * (dy));
             } else {
                 int indexSrc = ((srcY + (y * srcH / dstH)) * srcWidth + (srcX + (x * srcW / dstW))) * 4;
                 dst[indexDst + 0] = src[indexSrc + 0];
@@ -147,6 +159,13 @@ void scale(unsigned char *dst, int dstWidth, int dstX, int dstY, int dstW, int d
             }
         }
     }
+}
+
+unsigned long getTicks()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 int main(int argc, char **argv)
@@ -216,37 +235,31 @@ int main(int argc, char **argv)
     }
 
     // Load the gif
-    GifFileType *gif = DGifOpenFileName(argv[3], NULL);
+    gif = DGifOpenFileName(argv[3], NULL);
     if (!gif || DGifSlurp(gif) != GIF_OK || gif->ImageCount <= 1) {
-        if (gif)
-            DGifCloseFile(gif);
         fprintf(stderr, "error: %s: not an animated gif.\n", argv[3]);
         goto usage;
     }
 
-    // Gif info
-    nFrames = gif->ImageCount;
-
-    // Allocate frame array
-    frames = malloc(sizeof(Frame) * nFrames);
-    memset(frames, 0, sizeof(Frame) * nFrames);
-
     // Buffer for RGBA image data
-    unsigned char *data = malloc(gif->SWidth * gif->SHeight * 4);
+    data = malloc(gif->SWidth * gif->SHeight * 4);
     memset(data, 0, gif->SWidth * gif->SHeight * 4);
 
     // Rescaled wallpaper which encompasses the entire x11 screen;
     // not necessary for tiled mode
-    unsigned char *dataScaled;
     if (style != STYLE_TILE) {
         dataScaled = malloc(screen->width * screen->height * 4);
         memset(dataScaled, 0, screen->width * screen->height * 4);
     }
 
     // Graphics context for converting image
-    GC gc = XCreateGC(display, root, 0, 0);
+    gc = XCreateGC(display, root, 0, 0);
 
-    for (int i = 0; i < nFrames; i++) {
+    unsigned long ticks = getTicks();
+
+    int i = 0;
+    for (;;) {
+        unsigned long wait = 100;
         int transparent = -1;
         SavedImage *si = &gif->SavedImages[i];
 
@@ -255,7 +268,7 @@ int main(int argc, char **argv)
             if (si->ExtensionBlocks[j].Function == GRAPHICS_EXT_FUNC_CODE) {
                 GraphicsControlBlock gcb;
                 DGifExtensionToGCB(si->ExtensionBlocks[j].ByteCount, si->ExtensionBlocks[j].Bytes, &gcb);
-                frames[i].wait = gcb.DelayTime;
+                wait = gcb.DelayTime;
                 transparent = gcb.TransparentColor;
 
                 if (gcb.DisposalMode == DISPOSE_BACKGROUND)
@@ -309,22 +322,25 @@ int main(int argc, char **argv)
 
         case STYLE_TILE: {
             // First we render to the gif-sized pixmap, then we tile it onto a new pixmap.
-            Pixmap pixmap = XCreatePixmap(display, root, gif->SWidth, gif->SHeight, depth);
-            XImage *img = XCreateImage(display, CopyFromParent, depth, ZPixmap, 0, data, gif->SWidth, gif->SHeight, 32, 0);
-            XPutImage(display, pixmap, gc, img, 0, 0, 0, 0, gif->SWidth, gif->SHeight);
+            Pixmap pixmap1 = XCreatePixmap(display, root, gif->SWidth, gif->SHeight, depth);
+            XImage *img = XCreateImage(display, CopyFromParent, depth, ZPixmap, 0, (char *)data, gif->SWidth, gif->SHeight, 32, 0);
+            XPutImage(display, pixmap1, gc, img, 0, 0, 0, 0, gif->SWidth, gif->SHeight);
             img->data = NULL;
             XDestroyImage(img);
 
             // Now tile it onto the real pixmap
-            frames[i].pixmap = XCreatePixmap(display, root, screen->width, screen->height, depth);
+            Pixmap pixmap = XCreatePixmap(display, root, screen->width, screen->height, depth);
             XGCValues gc2values;
             gc2values.fill_style = FillTiled;
-            gc2values.tile = pixmap;
-            GC gc2 = XCreateGC(display, frames[i].pixmap, GCFillStyle | GCTile, &gc2values);
-            XFillRectangle(display, frames[i].pixmap, gc2, 0, 0, screen->width, screen->height);
+            gc2values.tile = pixmap1;
+            GC gc2 = XCreateGC(display, pixmap, GCFillStyle | GCTile, &gc2values);
+            XFillRectangle(display, pixmap, gc2, 0, 0, screen->width, screen->height);
             XFreeGC(display, gc2);
-            XSync(display, False);
-            XFreePixmap(display, pixmap);
+            // XSync(display, False);
+            XFreePixmap(display, pixmap1);
+
+            if (setWallpaper(pixmap))
+                return 1;
         } break;
 
         case STYLE_FIT: {
@@ -366,41 +382,28 @@ int main(int argc, char **argv)
                 scale(dataScaled, screen->width, monitors[j].x, monitors[j].y, monitors[j].w, monitors[j].h, data, gif->SWidth, srcX, srcY, srcW, srcH);
             }
         } break;
-
-        default:
-            fprintf(stderr, "error: not yet implemented\n");
-            free(dataScaled);
-            free(data);
-            XFreeGC(display, gc);
-            DGifCloseFile(gif);
-            return 1;
         }
 
         if (style != STYLE_TILE) {
             // Convert to a pixmap
-            frames[i].pixmap = XCreatePixmap(display, root, screen->width, screen->height, depth);
-            XImage *img = XCreateImage(display, CopyFromParent, depth, ZPixmap, 0, dataScaled, screen->width, screen->height, 32, 0);
-            XPutImage(display, frames[i].pixmap, gc, img, 0, 0, 0, 0, screen->width, screen->height);
+            Pixmap pixmap = XCreatePixmap(display, root, screen->width, screen->height, depth);
+            XImage *img = XCreateImage(display, CopyFromParent, depth, ZPixmap, 0, (char *)dataScaled, screen->width, screen->height, 32, 0);
+            XPutImage(display, pixmap, gc, img, 0, 0, 0, 0, screen->width, screen->height);
             img->data = NULL;
             XDestroyImage(img);
+
+            if (setWallpaper(pixmap))
+                return 1;
         }
-    }
 
-    // Free X11/gif shit
-    if (style != STYLE_TILE)
-        free(dataScaled);
-    free(data);
-    XFreeGC(display, gc);
-    DGifCloseFile(gif);
+        if (++i >= gif->ImageCount)
+            i = 0;
 
-    // Cycle through frames
-    frame = 0;
-    for (;;) {
-        if (setWallpaper(frames[frame].pixmap))
-            return 1;
-        usleep(frames[frame].wait * 10000);
-        if (++frame >= nFrames)
-            frame = 0;
+        // Regulate framerate
+        unsigned long ticksDelta = getTicks() - ticks;
+        if (ticksDelta < 10000 * wait)
+            usleep(10000 * wait - ticksDelta);
+        ticks = getTicks();
     }
 
     return 0;
