@@ -219,7 +219,7 @@ int main(int argc, char **argv)
     GifFileType *gif = DGifOpenFileName(argv[3], NULL);
     if (!gif || DGifSlurp(gif) != GIF_OK || gif->ImageCount <= 1) {
         if (gif)
-            DGifCloseFile(gif);
+            DGifCloseFile(gif, NULL);
         fprintf(stderr, "error: %s: not an animated gif.\n", argv[3]);
         goto usage;
     }
@@ -372,7 +372,7 @@ int main(int argc, char **argv)
             free(dataScaled);
             free(data);
             XFreeGC(display, gc);
-            DGifCloseFile(gif);
+            DGifCloseFile(gif, NULL);
             return 1;
         }
 
@@ -391,7 +391,7 @@ int main(int argc, char **argv)
         free(dataScaled);
     free(data);
     XFreeGC(display, gc);
-    DGifCloseFile(gif);
+    DGifCloseFile(gif, NULL);
 
     // Cycle through frames
     frame = 0;
